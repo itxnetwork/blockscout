@@ -30,9 +30,12 @@ defmodule Indexer.Block.Realtime.Fetcher do
   alias Explorer.Chain.Cache.Accounts
   alias Explorer.Chain.Events.Publisher
   alias Explorer.Counters.AverageBlockTime
+  alias Explorer.Utility.MissingRangesManipulator
   alias Indexer.{Block, Tracer}
   alias Indexer.Block.Realtime.TaskSupervisor
-  alias Indexer.Fetcher.CoinBalance
+  alias Indexer.Fetcher.{CoinBalance, CoinBalanceDailyUpdater}
+  alias Indexer.Fetcher.PolygonEdge.{DepositExecute, Withdrawal}
+  alias Indexer.Fetcher.Shibarium.L2, as: ShibariumBridgeL2
   alias Indexer.Prometheus
   alias Indexer.Transform.Addresses
   alias Timex.Duration
@@ -41,8 +44,14 @@ defmodule Indexer.Block.Realtime.Fetcher do
 
   @minimum_safe_polling_period :timer.seconds(1)
 
+  @shutdown_after :timer.minutes(1)
+
   @enforce_keys ~w(block_fetcher)a
-  defstruct ~w(block_fetcher subscription previous_number timer)a
+
+  defstruct block_fetcher: nil,
+            subscription: nil,
+            previous_number: nil,
+            timer: nil
 
   @type t :: %__MODULE__{
           block_fetcher: %Block.Fetcher{
@@ -53,7 +62,8 @@ defmodule Indexer.Block.Realtime.Fetcher do
             receipts_concurrency: pos_integer()
           },
           subscription: Subscription.t(),
-          previous_number: pos_integer() | nil
+          previous_number: pos_integer() | nil,
+          timer: reference()
         }
 
   def start_link([arguments, gen_server_options]) do
@@ -117,9 +127,14 @@ defmodule Indexer.Block.Realtime.Fetcher do
     new_previous_number =
       case EthereumJSONRPC.fetch_block_number_by_tag("latest", json_rpc_named_arguments) do
         {:ok, number} when is_nil(previous_number) or number != previous_number ->
-          start_fetch_and_import(number, block_fetcher, previous_number)
-
-          number
+          if abnormal_gap?(number, previous_number) do
+            new_number = max(number, previous_number)
+            start_fetch_and_import(new_number, block_fetcher, previous_number)
+            new_number
+          else
+            start_fetch_and_import(number, block_fetcher, previous_number)
+            number
+          end
 
         _ ->
           previous_number
@@ -166,7 +181,7 @@ defmodule Indexer.Block.Realtime.Fetcher do
     polling_period =
       case AverageBlockTime.average_block_time() do
         {:error, :disabled} -> 2_000
-        block_time -> round(Duration.to_milliseconds(block_time) / 2)
+        block_time -> min(round(Duration.to_milliseconds(block_time) / 2), 30_000)
       end
 
     safe_polling_period = max(polling_period, @minimum_safe_polling_period)
@@ -181,8 +196,6 @@ defmodule Indexer.Block.Realtime.Fetcher do
         block_fetcher,
         %{
           address_coin_balances: %{params: address_coin_balances_params},
-          address_coin_balances_daily: %{params: address_coin_balances_daily_params},
-          address_hash_to_fetched_balance_block_number: address_hash_to_block_number,
           addresses: %{params: addresses_params},
           block_rewards: block_rewards
         } = options
@@ -196,10 +209,8 @@ defmodule Indexer.Block.Realtime.Fetcher do
            }}} <-
            {:balances,
             balances(block_fetcher, %{
-              address_hash_to_block_number: address_hash_to_block_number,
               addresses_params: addresses_params,
-              balances_params: address_coin_balances_params,
-              balances_daily_params: address_coin_balances_daily_params
+              balances_params: address_coin_balances_params
             })},
          {block_reward_errors, chain_import_block_rewards} = Map.pop(block_rewards, :errors),
          chain_import_options =
@@ -208,8 +219,8 @@ defmodule Indexer.Block.Realtime.Fetcher do
            |> put_in([:addresses, :params], balances_addresses_params)
            |> put_in([:blocks, :params, Access.all(), :consensus], true)
            |> put_in([:block_rewards], chain_import_block_rewards)
-           |> put_in([Access.key(:address_coin_balances, %{}), :params], balances_params)
-           |> put_in([Access.key(:address_coin_balances_daily, %{}), :params], balances_daily_params),
+           |> put_in([Access.key(:address_coin_balances, %{}), :params], balances_params),
+         CoinBalanceDailyUpdater.add_daily_balances_params(balances_daily_params),
          {:import, {:ok, imported} = ok} <- {:import, Chain.import(chain_import_options)} do
       async_import_remaining_block_data(
         imported,
@@ -228,13 +239,13 @@ defmodule Indexer.Block.Realtime.Fetcher do
     {:ok, []}
   end
 
-  defp start_fetch_and_import(number, block_fetcher, previous_number) do
+  def start_fetch_and_import(number, block_fetcher, previous_number) do
     start_at = determine_start_at(number, previous_number)
     is_reorg = reorg?(number, previous_number)
 
     for block_number_to_fetch <- start_at..number do
       args = [block_number_to_fetch, block_fetcher, is_reorg]
-      Task.Supervisor.start_child(TaskSupervisor, __MODULE__, :fetch_and_import_block, args)
+      Task.Supervisor.start_child(TaskSupervisor, __MODULE__, :fetch_and_import_block, args, shutdown: @shutdown_after)
     end
   end
 
@@ -256,13 +267,30 @@ defmodule Indexer.Block.Realtime.Fetcher do
 
   defp reorg?(_, _), do: false
 
+  @default_max_gap 1000
+  defp abnormal_gap?(_number, nil), do: false
+
+  defp abnormal_gap?(number, previous_number) do
+    max_gap = Application.get_env(:indexer, __MODULE__)[:max_gap] || @default_max_gap
+
+    abs(number - previous_number) > max_gap
+  end
+
   @reorg_delay 5_000
 
   @decorate trace(name: "fetch", resource: "Indexer.Block.Realtime.Fetcher.fetch_and_import_block/3", tracer: Tracer)
   def fetch_and_import_block(block_number_to_fetch, block_fetcher, reorg?, retry \\ 3) do
+    Process.flag(:trap_exit, true)
+
     Indexer.Logger.metadata(
       fn ->
         if reorg? do
+          # we need to remove all rows from `polygon_edge_withdrawals` and `polygon_edge_deposit_executes` tables previously written starting from reorg block number
+          remove_polygon_edge_assets_by_number(block_number_to_fetch)
+
+          # we need to remove all rows from `shibarium_bridge` table previously written starting from reorg block number
+          remove_shibarium_assets_by_number(block_number_to_fetch)
+
           # give previous fetch attempt (for same block number) a chance to finish
           # before fetching again, to reduce block consensus mistakes
           :timer.sleep(@reorg_delay)
@@ -273,6 +301,19 @@ defmodule Indexer.Block.Realtime.Fetcher do
       fetcher: :block_realtime,
       block_number: block_number_to_fetch
     )
+  end
+
+  defp remove_polygon_edge_assets_by_number(block_number_to_fetch) do
+    if Application.get_env(:explorer, :chain_type) == "polygon_edge" do
+      Withdrawal.remove(block_number_to_fetch)
+      DepositExecute.remove(block_number_to_fetch)
+    end
+  end
+
+  defp remove_shibarium_assets_by_number(block_number_to_fetch) do
+    if Application.get_env(:explorer, :chain_type) == "shibarium" do
+      ShibariumBridgeL2.reorg_handle(block_number_to_fetch)
+    end
   end
 
   @decorate span(tracer: Tracer)
@@ -287,6 +328,7 @@ defmodule Indexer.Block.Realtime.Fetcher do
     case result do
       {:ok, %{inserted: inserted, errors: []}} ->
         log_import_timings(inserted, fetch_duration, time_before)
+        MissingRangesManipulator.clear_batch([block_number_to_fetch..block_number_to_fetch])
         Logger.debug("Fetched and imported.")
 
       {:ok, %{inserted: _, errors: [_ | _] = errors}} ->
@@ -405,7 +447,7 @@ defmodule Indexer.Block.Realtime.Fetcher do
        ) do
     case options
          |> fetch_balances_params_list()
-         |> EthereumJSONRPC.fetch_balances(json_rpc_named_arguments) do
+         |> EthereumJSONRPC.fetch_balances(json_rpc_named_arguments, CoinBalance.batch_size()) do
       {:ok, %FetchedBalances{params_list: params_list, errors: []}} ->
         merged_addresses_params =
           %{address_coin_balances: params_list}
@@ -422,7 +464,7 @@ defmodule Indexer.Block.Realtime.Fetcher do
         importable_balances_daily_params =
           Enum.map(params_list, fn param ->
             day = Map.get(block_timestamp_map, "#{param.block_number}")
-            Map.put(param, :day, day)
+            (day && Map.put(param, :day, day)) || param
           end)
 
         {:ok,
@@ -440,33 +482,11 @@ defmodule Indexer.Block.Realtime.Fetcher do
     end
   end
 
-  defp fetch_balances_params_list(%{
-         addresses_params: addresses_params,
-         address_hash_to_block_number: address_hash_to_block_number,
-         balances_params: balances_params
-       }) do
-    addresses_params
-    |> addresses_params_to_fetched_balances_params_set(%{address_hash_to_block_number: address_hash_to_block_number})
-    |> MapSet.union(balances_params_to_fetch_balances_params_set(balances_params))
+  defp fetch_balances_params_list(%{balances_params: balances_params}) do
+    balances_params
+    |> balances_params_to_fetch_balances_params_set()
     # stable order for easier moxing
     |> Enum.sort_by(fn %{hash_data: hash_data, block_quantity: block_quantity} -> {hash_data, block_quantity} end)
-  end
-
-  defp addresses_params_to_fetched_balances_params_set(addresses_params, %{
-         address_hash_to_block_number: address_hash_to_block_number
-       }) do
-    Enum.into(addresses_params, MapSet.new(), fn %{hash: address_hash} = address_params when is_binary(address_hash) ->
-      block_number =
-        case address_params do
-          %{fetched_coin_balance_block_number: block_number} when is_integer(block_number) ->
-            block_number
-
-          _ ->
-            Map.fetch!(address_hash_to_block_number, address_hash)
-        end
-
-      %{hash_data: address_hash, block_quantity: integer_to_quantity(block_number)}
-    end)
   end
 
   defp balances_params_to_fetch_balances_params_set(balances_params) do
