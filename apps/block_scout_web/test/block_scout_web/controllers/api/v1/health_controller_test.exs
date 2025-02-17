@@ -14,19 +14,18 @@ defmodule BlockScoutWeb.API.V1.HealthControllerTest do
     test "returns error when there are no blocks in db", %{conn: conn} do
       request = get(conn, api_health_path(conn, :health))
 
-      assert request.status == 500
+      assert request.status == 200
 
-      expected_response =
+      expected_error =
         %{
-          healthy: false,
-          error: %{
-            code: 5002,
-            message: "There are no blocks in the DB."
-          }
+          "code" => 5002,
+          "message" => "There are no blocks in the DB."
         }
-        |> Jason.encode!()
 
-      assert request.resp_body == expected_response
+      decoded_response = request.resp_body |> Jason.decode!()
+
+      assert decoded_response["metadata"]["blocks"]["healthy"] == false
+      assert decoded_response["metadata"]["blocks"]["error"] == expected_error
     end
 
     test "returns error when last block is stale", %{conn: conn} do
@@ -34,22 +33,20 @@ defmodule BlockScoutWeb.API.V1.HealthControllerTest do
 
       request = get(conn, api_health_path(conn, :health))
 
-      assert request.status == 500
+      assert request.status == 200
 
       assert %{
+               "latest_block" => %{
+                 "number" => _,
+                 "timestamp" => _
+               },
                "healthy" => false,
                "error" => %{
                  "code" => 5001,
                  "message" =>
                    "There are no new blocks in the DB for the last 5 mins. Check the healthiness of the JSON RPC archive node or the DB."
-               },
-               "metadata" => %{
-                 "latest_block" => %{
-                   "number" => _,
-                   "timestamp" => _
-                 }
                }
-             } = Poison.decode!(request.resp_body)
+             } = Poison.decode!(request.resp_body)["metadata"]["blocks"]
     end
 
     test "returns ok when last block is not stale", %{conn: conn} do
@@ -75,7 +72,7 @@ defmodule BlockScoutWeb.API.V1.HealthControllerTest do
                    "timestamp" => to_string(block1.timestamp)
                  }
                }
-             } == result["metadata"]
+             } == result["metadata"]["blocks"]
     end
   end
 
@@ -91,22 +88,20 @@ defmodule BlockScoutWeb.API.V1.HealthControllerTest do
 
     request = get(conn, api_health_path(conn, :health))
 
-    assert request.status == 500
+    assert request.status == 200
 
     assert %{
+             "latest_block" => %{
+               "number" => _,
+               "timestamp" => _
+             },
              "healthy" => false,
              "error" => %{
                "code" => 5001,
                "message" =>
                  "There are no new blocks in the DB for the last 5 mins. Check the healthiness of the JSON RPC archive node or the DB."
-             },
-             "metadata" => %{
-               "latest_block" => %{
-                 "number" => _,
-                 "timestamp" => _
-               }
              }
-           } = Poison.decode!(request.resp_body)
+           } = Poison.decode!(request.resp_body)["metadata"]["blocks"]
   end
 
   defp api_health_path(conn, action) do
